@@ -1,0 +1,17 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Navigator runtime data
+.env
+data/
+runs/
+.pytest_cache/
+FEATURES.md

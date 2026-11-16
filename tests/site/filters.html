@@ -1,0 +1,14 @@
+<!doctype html><html><head><title>Cards</title><style>
+.c{position:relative;width:20px;height:20px;display:inline-block}
+.c input{position:absolute;width:1px;height:1px;opacity:1}
+.c div{position:absolute;inset:0;border:1px solid #000}
+</style></head><body>
+<main><nav><a href="index.html">Home</a></nav></main>
+<h1>Credit cards</h1>
+<button type="button">Annual fee</button>
+<label><span class="c"><input type="checkbox" id="nf" onchange="document.getElementById('r').textContent=this.checked?'1 of 2 results':'2 results'"><div></div></span> No annual fee</label>
+<p id="r">2 results</p>
+<a href="card.html?utm=1&x=2">Alpha Card</a><a href="card.html?utm=1&x=2"><img alt="Alpha Card image" src="data:,"></a>
+<a href="https://other.example/redirect/xyz?track=1">GO TO SITE</a>
+<p>Alpha Card score 9.5 fee $0</p><p>Beta Card score 7.0 fee $99</p>
+</body></html>
