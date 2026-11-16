@@ -144,6 +144,15 @@ To confirm the port is up, open <http://localhost:9222/json/version> in another 
 uv run python main.py --cdp-url http://localhost:9222 --url "https://www.example-store.com/account/orders" --goal "List my five most recent orders with date, item names and total" --success "Return JSON list of orders with order_date, items and total" --dry-run
 ```
 
+Another example, reading and summarising content on a signed-in site (replace the site and `<contact name>`):
+
+```bash
+uv run python main.py --cdp-url http://localhost:9222 --url "https://www.example-network.com/feed/" --goal "Summarise the last 2 posts by <contact name>, who is in my contacts" --success "Return JSON with post date, a two-sentence summary and the link for each post" --dry-run
+```
+
+Check the site's terms before automating a signed-in account: some sites (social networks in particular)
+prohibit automated access and may restrict accounts that use it.
+
 - `--url` is the page to start from; `--goal` is the task in plain English; keep `--dry-run` on while testing.
 - The agent attaches to your open tab and navigates to `--url`. If it still asks you to sign in, do it in that
   window and press Enter.
