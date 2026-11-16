@@ -433,3 +433,31 @@ def test_agent_survives_login_popup_closing(tmp_path, session, site_url):
     agent, _ = make_agent(tmp_path, session, task, steps)
     res = agent.run()
     assert popup_holder and res.status == "success"
+
+
+# ------------------------------------------- custom (non-button) option controls, e.g. styled pills
+def test_snapshot_lists_custom_clickable_options_and_they_can_be_clicked(tmp_path, session, site_url):
+    session.page.goto(site_url + "/options.html")
+    snap = take_snapshot(session.page)
+    labels = {e["label"]: e for e in snap.elements}
+    for name in ("1", "2", "3", "Yes", "No", "Next"):
+        assert name in labels, f"{name!r} missing from {sorted(labels)}"
+    assert labels["2"].get("custom") and labels["Yes"].get("custom")  # plain div / label wrapping a hidden radio
+    assert not any("explanatory text" in e["label"] for e in snap.elements)  # long clickable blocks are not options
+    assert "(custom clickable option)" in snap.render()
+
+    task = Task(url=site_url + "/options.html", goal="x")
+    steps = [
+        lambda m: ("click", {"id": find_id(m, "2")}),
+        lambda m: ("click", {"id": find_id(m, "Yes")}),
+        lambda m: ("done", {"success": True, "summary": "ok"}),
+    ]
+    agent, _ = make_agent(tmp_path, session, task, steps)
+    agent.run()
+    assert session.page.inner_text("#out") == "storeys=2 raised=y"
+
+
+def test_snapshot_elements_stay_in_page_order(session, site_url):
+    session.page.goto(site_url + "/options.html")
+    labels = [e["label"] for e in take_snapshot(session.page).elements]
+    assert labels.index("1") < labels.index("Yes") < labels.index("Next")

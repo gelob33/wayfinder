@@ -59,7 +59,26 @@ _JS = r"""
   const out = [];
   let hasPassword = false;
   let n = 0;
-  for (const e of document.querySelectorAll(SEL)) {
+  // Standard controls, plus "custom controls": short labelled elements that look clickable
+  // (cursor: pointer) but are plain divs/spans/labels, e.g. styled option cards and radio pills.
+  const base = [...document.querySelectorAll(SEL)];
+  const baseSet = new Set(base);
+  const extraSet = new Set();
+  for (const e of document.querySelectorAll('label, li, div, span, p, td, img')) {
+    if (extraSet.size >= 150) break;
+    if (baseSet.has(e)) continue;
+    const t = e.innerText || '';
+    if (!t.trim() || t.length > 80) continue;
+    if (!vis(e) || getComputedStyle(e).cursor !== 'pointer') continue;
+    let covered = false;  // outermost clickable wins
+    for (let a = e.parentElement; a; a = a.parentElement) {
+      if (baseSet.has(a) || extraSet.has(a)) { covered = true; break; }
+    }
+    if (!covered) extraSet.add(e);
+  }
+  const all = [...base, ...extraSet].sort((a, b) =>
+    (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING) ? -1 : 1);
+  for (const e of all) {
     if (n >= maxEls) break;
     const tag = e.tagName.toLowerCase();
     const type = (e.getAttribute('type') || '').toLowerCase();
@@ -77,6 +96,7 @@ _JS = r"""
       inView: r.bottom > 0 && r.top < innerHeight,
     };
     e.setAttribute('data-nav-id', String(item.id));
+    if (extraSet.has(e)) item.custom = true;
     if (tag === 'a') item.href = e.getAttribute('href');
     if (tag === 'input' || tag === 'textarea' || tag === 'select') {
       if (type === 'checkbox' || type === 'radio') item.checked = e.checked;
@@ -172,6 +192,8 @@ def _fmt(e: dict) -> str:
             parts.append(flag)
     if e.get("post") and (e.get("submits") or e["tag"] in ("input", "textarea")):
         parts.append("POST-form(submitting needs approval)")
+    if e.get("custom"):
+        parts.append("(custom clickable option)")
     if e.get("sensitive"):
         parts.append("SENSITIVE(never fill)")
     if not e.get("inView"):

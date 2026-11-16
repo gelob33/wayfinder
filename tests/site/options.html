@@ -1,0 +1,28 @@
+<!doctype html><html><head><title>Your home</title><style>
+.pill{display:inline-block;padding:8px 14px;border:1px solid #333;margin:4px;cursor:pointer;border-radius:8px}
+.pill.on{background:#cfe8ff}
+.radio{position:relative;display:inline-block;margin:4px;cursor:pointer}
+.radio input{position:absolute;opacity:0;width:1px;height:1px}
+.radio span{display:inline-block;padding:8px 14px;border:1px solid #333;border-radius:8px}
+</style></head><body><main>
+<h1>Tell us about your home</h1>
+<p>How many storeys does your home have?</p>
+<div id="storeys">
+  <div class="pill" id="s1">1</div><div class="pill" id="s2">2</div><div class="pill" id="s3">3</div>
+</div>
+<p>Is your home raised above the ground?</p>
+<label class="radio"><input type="radio" name="raised" value="y"><span>Yes</span></label>
+<label class="radio"><input type="radio" name="raised" value="n"><span>No</span></label>
+<p id="out">nothing chosen</p>
+<button type="button">Next</button>
+<div style="cursor:pointer"><p>This long block of explanatory text is clickable as a whole but it is far too long to be an option label and should not be listed.</p></div>
+</main>
+<script>
+document.querySelectorAll('.pill').forEach(p => p.addEventListener('click', () => {
+  document.querySelectorAll('.pill').forEach(x => x.classList.remove('on')); p.classList.add('on');
+  document.getElementById('out').textContent = 'storeys=' + p.textContent;
+}));
+document.querySelectorAll('.radio input').forEach(i => i.addEventListener('change', () => {
+  document.getElementById('out').textContent += ' raised=' + i.value;
+}));
+</script></body></html>
