@@ -4,6 +4,8 @@
 an LLM agent (Claude) drives a real browser (Playwright): it studies the page, plans, acts and verifies each step.
 If it hits a sign-in page, the run **pauses** until you log in yourself in the browser window.
 
+![How Wayfinder works: you give a site and a goal; the robot reads the page, plans, clicks and checks each step; it pauses so you can sign in; it returns the answer with a step-by-step log](docs/wayfinder-overview.svg)
+
 See [FEATURES.md](FEATURES.md) for the full feature map. This is **Phase 1 (MVP)**.
 
 ## Quick start
