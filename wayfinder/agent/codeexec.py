@@ -1,14 +1,19 @@
-"""Run model-written Playwright code against a *guarded* page.
+"""Run model-written Playwright code against a *guarded* page (opt-in: --allow-code).
 
-The model sees the page and writes short Playwright (sync Python) snippets. Safety is
-enforced here, not by the prompt:
+IMPORTANT: this is defence in depth, NOT a security boundary. Python cannot be sandboxed
+reliably in-process, so the tool is disabled unless the person passes --allow-code, and it
+should only be enabled for sites they trust. What the guards do:
 
-* AST screening: no imports, no dunder access, no eval/exec/open/getattr, no `while`.
-* The `page` the code receives is a proxy: it never exposes the browser context, network
-  routing or init scripts; `goto` is limited to links the agent has seen on allowed domains.
-* Typing into password/card/one-time-code fields is refused.
-* Clicking submit/pay/send/delete-like elements is blocked in dry-run, or needs human approval.
-* A wall-clock budget stops runaway loops.
+* AST screening: no imports, no underscore/frame attributes, no eval/exec/open/getattr,
+  no `while`, no str.format (attribute access through format strings).
+* No modules in scope: `re` and `json` are small facades exposing a few functions only.
+* The `page` the code receives is a proxy with a default-deny return filter: only plain data
+  and (wrapped) locators come back, so the raw Page, BrowserContext, frames and element
+  handles are unreachable. In-page JavaScript (`evaluate`, `dispatch_event`, ...) is blocked.
+* Typing into / reading password, card and one-time-code fields is refused.
+* Clicks on submit/pay/send-like elements, submit controls of POST forms, and Enter inside
+  POST forms are blocked in dry-run, or need human approval.
+* `goto` is limited to links the agent has seen on allowed domains; a time budget stops loops.
 """
 
 from __future__ import annotations
@@ -21,10 +26,23 @@ import json
 import re
 import time
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Callable
 
 from playwright.sync_api import Locator, Page
 
+from ..safety.pagechecks import (
+    ACTIVATE_KEYS,
+    ACTIVE_BUTTON_LABEL_JS,
+    ACTIVE_IN_POST_FORM_JS,
+    ACTIVE_SENSITIVE_JS,
+    BUTTON_LABEL_JS,
+    ENTER_KEYS,
+    IN_POST_FORM_JS,
+    IS_SUBMIT_CONTROL_JS,
+    LABEL_JS,
+    SENSITIVE_JS,
+)
 from ..safety.policy import RISKY_LABEL, domain_allowed, normalize_url
 
 MAX_CODE_CHARS = 4000
@@ -35,11 +53,23 @@ FORBIDDEN_NAMES = {
     "open", "exec", "eval", "compile", "__import__", "globals", "locals", "vars", "getattr",
     "setattr", "delattr", "input", "breakpoint", "memoryview", "type", "object", "super",
 }
-FORBIDDEN_PAGE_ATTRS = {
+# Attribute names that reach interpreter internals or read attributes via strings.
+FORBIDDEN_ATTR_PREFIXES = ("_", "gi_", "cr_", "ag_", "f_", "tb_", "co_")
+FORBIDDEN_ATTRS = {"format", "format_map", "mro", "subclasses"}
+# Never available on the page or on locators (in-page JS, raw handles, context, network, ...).
+FORBIDDEN_MEMBERS = {
     "context", "request", "route", "unroute", "route_from_har", "expose_function", "expose_binding",
     "add_init_script", "set_extra_http_headers", "set_content", "frames", "main_frame", "frame",
-    "frame_locator", "video", "pdf", "close", "on", "once", "remove_listener", "route_web_socket",
+    "frame_locator", "content_frame", "video", "pdf", "close", "on", "once", "remove_listener",
+    "route_web_socket", "evaluate", "evaluate_all", "evaluate_handle", "dispatch_event", "add_script_tag",
+    "add_style_tag", "wait_for_function", "set_input_files", "element_handle", "element_handles",
+    "query_selector", "query_selector_all", "wait_for_selector", "page", "owner", "workers", "opener",
+    "screenshot", "pause", "bring_to_front", "emulate_media", "set_viewport_size", "touchscreen",
+    "request_gc", "console_messages", "page_errors", "requests", "clock",
 }
+# Navigation helpers whose return value (a Response object) is dropped.
+RETURNS_NOTHING = {"reload", "go_back", "go_forward", "wait_for_url", "wait_for_load_state"}
+
 SAFE_BUILTINS = {
     n: getattr(builtins, n)
     for n in (
@@ -48,16 +78,11 @@ SAFE_BUILTINS = {
         "ValueError KeyError IndexError"
     ).split()
 }
+PLAIN = (str, int, float, bool, type(None))
 
-_SENSITIVE_JS = """e => {
-  const t = (e.getAttribute('type') || '').toLowerCase();
-  const ac = (e.getAttribute('autocomplete') || '').toLowerCase();
-  return t === 'password' || /^cc-|one-time-code|current-password|new-password/.test(ac) ||
-    (e.tagName === 'INPUT' && /card|cvv|cvc|iban|ssn|otp|one.?time|security.?code|account.?number|routing/i
-      .test((e.name || '') + ' ' + (e.id || '')));
-}"""
-_LABEL_JS = "e => (e.getAttribute('aria-label') || e.innerText || e.value || '').trim().slice(0, 100)"
-_ACTIVE_SENSITIVE_JS = "(() => { const e = document.activeElement; return !!e && (" + _SENSITIVE_JS + ")(e); })()"
+_POINT = "([x, y]) => { let e = document.elementFromPoint(x, y); if (!e) return %s; e = e.closest('button, a, input, [role=button], label') || e; return (%s)(e); }"
+_POINT_LABEL_JS = _POINT % ("null", LABEL_JS)
+_POINT_SUBMITS_POST_JS = _POINT % ("false", "e => (" + IS_SUBMIT_CONTROL_JS + ")(e) && (" + IN_POST_FORM_JS + ")(e)")
 
 
 class GuardError(Exception):
@@ -65,7 +90,7 @@ class GuardError(Exception):
 
 
 def screen(code: str) -> None:
-    """Reject code that tries to escape the sandbox. Raises GuardError."""
+    """Reject code that tries to escape the guards. Raises GuardError."""
     if len(code) > MAX_CODE_CHARS:
         raise GuardError(f"code too long (>{MAX_CODE_CHARS} chars); split it into smaller steps")
     try:
@@ -79,8 +104,10 @@ def screen(code: str) -> None:
             raise GuardError(f"{type(node).__name__} is not allowed (use for-loops over finite lists)")
         if isinstance(node, ast.Name) and (node.id in FORBIDDEN_NAMES or node.id.startswith("__")):
             raise GuardError(f"name '{node.id}' is not allowed")
-        if isinstance(node, ast.Attribute) and node.attr.startswith("_"):
-            raise GuardError(f"attribute '{node.attr}' is not allowed")
+        if isinstance(node, ast.Attribute) and (
+            node.attr.startswith(FORBIDDEN_ATTR_PREFIXES) or node.attr in FORBIDDEN_ATTRS
+        ):
+            raise GuardError(f"attribute '{node.attr}' is not allowed (use f-strings instead of .format)")
 
 
 @dataclass
@@ -90,6 +117,13 @@ class Policy:
     dry_run: bool
     require_approval: bool
     approve: Callable[[str], bool]
+
+    def gate(self, what: str) -> None:
+        """Dry-run block / human approval for something that may not be reversible."""
+        if self.dry_run:
+            raise GuardError(f"blocked (dry run): {what} would submit/pay/send. Not done.")
+        if self.require_approval and not self.approve(f"{what} (via generated code)"):
+            raise GuardError(f"declined: the person did not approve: {what}.")
 
 
 class _Budget:
@@ -101,73 +135,111 @@ class _Budget:
             raise GuardError(f"code exceeded {MAX_SECONDS}s; do less per call")
 
 
-class GuardedLocator:
-    _TYPING = {"fill", "type", "press_sequentially"}
+class _Guarded:
+    """Shared plumbing: member deny-list, time budget, default-deny filter on return values."""
+
+    _policy: Policy
+    _budget: _Budget
+
+    def _enter(self, name: str) -> None:
+        if name.startswith("_") or name in FORBIDDEN_MEMBERS:
+            raise AttributeError(f"'{name}' is not available in generated code")
+        self._budget.check()
+
+    def _safe(self, value, name: str):
+        if isinstance(value, Locator):
+            return GuardedLocator(value, self._policy, self._budget)
+        if isinstance(value, PLAIN):
+            return value
+        if isinstance(value, (list, tuple)):
+            return [self._safe(v, name) for v in value]
+        if isinstance(value, dict):
+            return {k: self._safe(v, name) for k, v in value.items() if isinstance(k, PLAIN)}
+        raise GuardError(f"'{name}' returns a {type(value).__name__}, which is not available in generated code")
+
+    def _call(self, attr, name: str):
+        if not callable(attr):
+            return self._safe(attr, name)
+
+        def call(*a, **k):
+            result = attr(*a, **k)
+            return None if name in RETURNS_NOTHING else self._safe(result, name)
+
+        return call
+
+
+class GuardedLocator(_Guarded):
+    _TYPING = {"fill", "type", "press_sequentially", "clear"}
+    _READING = {"input_value"}
     _CLICKING = {"click", "dblclick", "tap"}
 
     def __init__(self, loc: Locator, policy: Policy, budget: _Budget):
         self._loc, self._policy, self._budget = loc, policy, budget
 
-    def _wrap(self, value):
-        if isinstance(value, Locator):
-            return GuardedLocator(value, self._policy, self._budget)
-        return value
+    def _is(self, js: str) -> bool:
+        return bool(self._loc.first.evaluate(js))
 
     def __getattr__(self, name):
-        if name.startswith("_"):
-            raise AttributeError(name)
-        self._budget.check()
+        self._enter(name)
         attr = getattr(self._loc, name)
-        if name in self._TYPING:
-            def typed(*a, **k):
-                if self._loc.first.evaluate(_SENSITIVE_JS):
-                    raise GuardError("refused: that is a password/card/one-time-code field; the person must type it")
-                return attr(*a, **k)
-            return typed
+        if name in self._TYPING or name in self._READING:
+            def guarded_io(*a, **k):
+                if self._is(SENSITIVE_JS):
+                    raise GuardError("refused: that is a password/card/one-time-code field; only the person may use it")
+                return self._safe(attr(*a, **k), name)
+            return guarded_io
         if name in self._CLICKING:
             def clicked(*a, **k):
-                label = self._loc.first.evaluate(_LABEL_JS)
-                if RISKY_LABEL.search(label or ""):
-                    if self._policy.dry_run:
-                        raise GuardError(f'blocked (dry run): "{label}" would submit/pay/send. Not clicked.')
-                    if self._policy.require_approval and not self._policy.approve(f'Click "{label}" (via generated code)'):
-                        raise GuardError(f'declined: the person did not approve clicking "{label}".')
-                return attr(*a, **k)
+                label = self._loc.first.evaluate(LABEL_JS) or ""
+                if RISKY_LABEL.search(label) or (self._is(IS_SUBMIT_CONTROL_JS) and self._is(IN_POST_FORM_JS)):
+                    self._policy.gate(f'Click "{label}"')
+                return self._safe(attr(*a, **k), name)
             return clicked
-        if callable(attr):
-            return lambda *a, **k: self._wrap(attr(*a, **k))
-        return self._wrap(attr)
+        if name == "press":
+            def pressed(key, *a, **k):
+                if len(str(key)) == 1 and self._is(SENSITIVE_JS):
+                    raise GuardError("refused: that is a password/card/one-time-code field; only the person may type there")
+                k_ = str(key).lower()
+                label = self._loc.first.evaluate(BUTTON_LABEL_JS) if k_ in ACTIVATE_KEYS else ""
+                if label and RISKY_LABEL.search(label):
+                    self._policy.gate(f'Activate "{label}" ({key})')
+                elif k_ in ENTER_KEYS and self._is(IN_POST_FORM_JS):
+                    self._policy.gate("Submit the form (Enter)")
+                return self._safe(attr(key, *a, **k), name)
+            return pressed
+        return self._call(attr, name)
 
 
-class GuardedKeyboard:
-    def __init__(self, page: Page, budget: _Budget):
-        self._page, self._budget = page, budget
+class GuardedKeyboard(_Guarded):
+    def __init__(self, page: Page, policy: Policy, budget: _Budget):
+        self._page, self._policy, self._budget = page, policy, budget
 
     def __getattr__(self, name):
-        if name.startswith("_"):
-            raise AttributeError(name)
-        self._budget.check()
+        self._enter(name)
         attr = getattr(self._page.keyboard, name)
         if name in ("type", "insert_text"):
             def typed(*a, **k):
-                if self._page.evaluate(_ACTIVE_SENSITIVE_JS):
+                if self._page.evaluate(ACTIVE_SENSITIVE_JS):
                     raise GuardError("refused: focus is in a password/card/one-time-code field")
                 return attr(*a, **k)
             return typed
-        return attr
+        if name in ("press", "down"):
+            def pressed(key, *a, **k):
+                if len(str(key)) == 1 and self._page.evaluate(ACTIVE_SENSITIVE_JS):
+                    raise GuardError("refused: focus is in a password/card/one-time-code field")
+                k_ = str(key).lower()
+                label = self._page.evaluate(ACTIVE_BUTTON_LABEL_JS) if k_ in ACTIVATE_KEYS else ""
+                if label and RISKY_LABEL.search(label):
+                    self._policy.gate(f'Activate "{label}" ({key})')
+                elif k_ in ENTER_KEYS and self._page.evaluate(ACTIVE_IN_POST_FORM_JS):
+                    self._policy.gate("Submit the focused form (Enter)")
+                return attr(key, *a, **k)
+            return pressed
+        return self._call(attr, name)
 
 
-_POINT_LABEL_JS = """([x, y]) => {
-  const e = document.elementFromPoint(x, y);
-  if (!e) return null;
-  const t = e.closest('button, a, input, [role=button], label') || e;
-  return (t.getAttribute('aria-label') || t.innerText || t.value || '').trim().slice(0, 100);
-}"""
-_POINT_SENSITIVE_JS = "([x, y]) => { const e = document.elementFromPoint(x, y); return !!e && (" + _SENSITIVE_JS + ")(e); }"
-
-
-class GuardedMouse:
-    """Coordinate mouse: the element under the pointer gets the same risky-click guard as locators."""
+class GuardedMouse(_Guarded):
+    """Coordinate mouse: the element under the pointer gets the same guards as locator clicks."""
 
     _PRESSING = {"click", "dblclick", "down"}
 
@@ -176,9 +248,7 @@ class GuardedMouse:
         self._pos = (0.0, 0.0)
 
     def __getattr__(self, name):
-        if name.startswith("_"):
-            raise AttributeError(name)
-        self._budget.check()
+        self._enter(name)
         attr = getattr(self._page.mouse, name)
         if name == "move":
             def moved(x, y, **k):
@@ -187,28 +257,27 @@ class GuardedMouse:
             return moved
         if name in self._PRESSING:
             def pressed(*a, **k):
-                pt = [a[0], a[1]] if name != "down" and len(a) >= 2 else list(self._pos)
                 if name != "down" and len(a) >= 2:
                     self._pos = (a[0], a[1])
-                label = self._page.evaluate(_POINT_LABEL_JS, pt)
-                if RISKY_LABEL.search(label or ""):
-                    if self._policy.dry_run:
-                        raise GuardError(f'blocked (dry run): "{label}" would submit/pay/send. Not clicked.')
-                    if self._policy.require_approval and not self._policy.approve(f'Mouse click on "{label}" (via generated code)'):
-                        raise GuardError(f'declined: the person did not approve clicking "{label}".')
+                pt = list(self._pos)
+                label = self._page.evaluate(_POINT_LABEL_JS, pt) or ""
+                if RISKY_LABEL.search(label) or self._page.evaluate(_POINT_SUBMITS_POST_JS, pt):
+                    self._policy.gate(f'Mouse click on "{label}"')
                 return attr(*a, **k)
             return pressed
-        return attr
+        return self._call(attr, name)
 
 
-class GuardedPage:
-    _SELECTOR_ACTIONS = {"fill", "type", "click", "dblclick", "check", "uncheck", "select_option", "hover", "press", "text_content", "inner_text", "is_visible", "is_checked"}
+class GuardedPage(_Guarded):
+    # page.click("sel") etc. are routed through a guarded locator so the same checks apply.
+    _SELECTOR_ACTIONS = {
+        "fill", "type", "click", "dblclick", "tap", "check", "uncheck", "set_checked", "select_option", "hover",
+        "press", "focus", "text_content", "inner_text", "inner_html", "input_value", "get_attribute",
+        "is_visible", "is_hidden", "is_checked", "is_enabled", "is_disabled", "is_editable",
+    }
 
     def __init__(self, page: Page, policy: Policy, budget: _Budget):
         self._page, self._policy, self._budget = page, policy, budget
-
-    def _wrap(self, value):
-        return GuardedLocator(value, self._policy, self._budget) if isinstance(value, Locator) else value
 
     @property
     def mouse(self):
@@ -216,7 +285,7 @@ class GuardedPage:
 
     @property
     def keyboard(self):
-        return GuardedKeyboard(self._page, self._budget)
+        return GuardedKeyboard(self._page, self._policy, self._budget)
 
     def goto(self, url, **k):
         self._budget.check()
@@ -224,20 +293,26 @@ class GuardedPage:
             raise GuardError(f"blocked: {url} is outside the allowed site(s)")
         if normalize_url(url) not in self._policy.seen_urls():
             raise GuardError("blocked: goto only works for URLs of links seen in an observation; click the link instead")
-        return self._page.goto(url, **k)
+        self._page.goto(url, **k)
 
     def __getattr__(self, name):
-        if name.startswith("_") or name in FORBIDDEN_PAGE_ATTRS:
-            raise AttributeError(f"'{name}' is not available")
-        self._budget.check()
-        if name in self._SELECTOR_ACTIONS:  # page.click("sel") -> same guards as locator.click()
+        self._enter(name)
+        if name in self._SELECTOR_ACTIONS:
             def via_locator(selector, *a, **k):
                 return getattr(GuardedLocator(self._page.locator(selector).first, self._policy, self._budget), name)(*a, **k)
             return via_locator
-        attr = getattr(self._page, name)
-        if callable(attr):
-            return lambda *a, **k: self._wrap(attr(*a, **k))
-        return self._wrap(attr)
+        return self._call(getattr(self._page, name), name)
+
+
+def _facades() -> dict:
+    """`re` and `json` without the modules themselves (modules lead back to sys/os/builtins)."""
+    flags = {n: int(getattr(re, n)) for n in ("IGNORECASE", "I", "MULTILINE", "M", "DOTALL", "S")}
+    re_ns = SimpleNamespace(
+        search=re.search, match=re.match, fullmatch=re.fullmatch, findall=re.findall,
+        sub=re.sub, split=re.split, escape=re.escape, **flags,
+    )
+    json_ns = SimpleNamespace(dumps=json.dumps, loads=json.loads)
+    return {"re": re_ns, "json": json_ns}
 
 
 def run_code(code: str, page: Page, policy: Policy) -> str:
@@ -248,7 +323,6 @@ def run_code(code: str, page: Page, policy: Policy) -> str:
         return f"REJECTED: {e}"
 
     budget = _Budget(MAX_SECONDS)
-    guarded = GuardedPage(page, policy, budget)
     out = io.StringIO()
 
     def _print(*a, **k):
@@ -257,10 +331,9 @@ def run_code(code: str, page: Page, policy: Policy) -> str:
 
     ns: dict = {
         "__builtins__": {**SAFE_BUILTINS, "print": _print},
-        "page": guarded,
+        "page": GuardedPage(page, policy, budget),
         "nav": lambda i: GuardedLocator(page.locator(f'[data-nav-id="{int(i)}"]').first, policy, budget),
-        "re": re,
-        "json": json,
+        **_facades(),
     }
     try:
         exec(compile(code, "<agent>", "exec"), ns)

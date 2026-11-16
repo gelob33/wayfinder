@@ -4,7 +4,7 @@
 an LLM agent (Claude) drives a real browser (Playwright): it studies the page, plans, acts and verifies each step.
 If it hits a sign-in page, the run **pauses** until you log in yourself in the browser window.
 
-![How Wayfinder works: you give a site and a goal; the robot reads the page, plans, clicks and checks each step; it pauses so you can sign in; it returns the answer with a step-by-step log](docs/wayfinder-overview.svg)
+![How Wayfinder works: you give a site and a goal; the robot reads the page, plans, clicks and checks each step; it pauses so you can sign in; it returns the answer with a step-by-step log](docs/wayfinder.png)
 
 See [FEATURES.md](FEATURES.md) for the full feature map. This is **Phase 1 (MVP)**.
 
@@ -66,7 +66,7 @@ uv run python main.py --url https://your-site.com \
 (In Git Bash a backslash `\` at the end of a line continues the command. Or put it all on one line.)
 
 - `-i key=value` gives the agent data it may type into forms. It is told not to invent personal data; if something is missing it asks you in the terminal.
-- Start with `--dry-run` (never clicks submit/pay/send-like buttons). Remove it once you trust the flow; without it you are asked `Allow? [y/N]` before each such click.
+- Start with `--dry-run`. It blocks clicks on submit/pay/send-like buttons and any submission of a POST form (button or Enter); plain GET forms such as site search still work. Without it you are asked `Allow? [y/N]` before each such action. These checks are heuristics, not a guarantee: watch the first run on any new site.
 
 ## When the run pauses (you are needed)
 
@@ -75,7 +75,8 @@ uv run python main.py --url https://your-site.com \
 | `PAUSED: sign-in needed` | Log in **in the browser window** yourself (including MFA/CAPTCHA), then press **Enter** in the terminal. Type `abort` to stop. The sign-in is saved in `data/browser-profile/`, so you won't need to repeat it next time. See [Websites that require sign-in](#websites-that-require-sign-in). |
 | `PAUSED: the site is showing a bot-verification (CAPTCHA) page` | Complete it in the window if it lets you, then press Enter. If the site keeps rejecting the agent's browser the run ends as `blocked`; try [Mode B](#mode-b-hand-over-your-own-browser-sign-in-yourself-then-let-the-agent-work). |
 | `The agent needs your input` | Type your answer and press Enter. Don't type passwords or card numbers. |
-| `APPROVAL NEEDED` | Type `y` to allow the click, anything else to decline. |
+| `APPROVAL NEEDED` | The agent wants to click a submit/pay/send-like button or submit a POST form. Type `y` to allow, anything else to decline. |
+| `SIGN-IN ON ANOTHER SITE` | The agent was sent to a login page on a different host. Type `y` only if you recognise the host as your real sign-in provider (e.g. `accounts.google.com`); a look-alike may be phishing. Declining sends the agent back. |
 
 Press **Ctrl+C** at any time to stop; the partial log is still saved.
 
@@ -179,8 +180,9 @@ Notes:
 | `--url`, `--goal` | Required: start page and what to achieve |
 | `--success` | Describes the output you want (shapes the JSON result) |
 | `-i key=value` | Input data for forms (repeatable) |
-| `--dry-run` | Block submit/pay/send/delete-like clicks |
-| `--no-approval` | Don't ask before such clicks (use with care) |
+| `--dry-run` | Block submit/pay/send/delete-like clicks and POST form submissions |
+| `--no-approval` | Don't ask before such actions (use with care) |
+| `--allow-code` | Let the agent write and run Playwright code (`run_playwright`) for hover menus, drag and bulk reading. **Off by default; only for sites you trust** (see Security) |
 | `--max-steps` (40), `--max-seconds` (900) | Budgets |
 | `--headless` | Hide the browser (don't use if a sign-in may be needed) |
 | `--channel chrome` | Use your installed Chrome (or `msedge`) instead of bundled Chromium |
@@ -197,11 +199,34 @@ Each run creates `runs/<YYYYMMDD-HHMMSS>/`:
 |---|---|
 | `result.json` | status (`success`, `incomplete` = agent claimed done with unverified checklist items, `failed`, `aborted`, `budget_exceeded`, `error`), the checklist, summary, your requested output in `result`, step and token counts |
 | `steps.jsonl` | one line per action: args (incl. plans and generated code), outcome, URL, detected changes, login-pause events |
-| `step-000.txt`, `step-001.txt`, ... | exactly what the agent saw after each step (for auditing its claims) |
+| `step-000.txt`, `step-001.txt`, ... | what the agent saw after each step (for auditing its claims) |
 | `step-001.png`, ... | screenshot after each step |
 
 The terminal prints `Run folder: ...` at the start and `log: ...` at the end. Exit code is `0` only on success.
 `runs/` and `data/` are git-ignored; `data/browser-profile/` holds your session cookies, so keep it private.
+
+## Security
+
+Wayfinder drives a real browser with your sessions and feeds web pages to an AI model, so treat it with care.
+
+- **Web pages are untrusted input.** A page can contain text written to manipulate the model ("prompt injection").
+  Wayfinder limits what a manipulated model can do (below), but cannot rule it out. Don't point it at sites you
+  don't trust while signed in to accounts that matter.
+- **`--allow-code` is off by default, on purpose.** With it, the model writes Python that runs on your machine.
+  The guards around that code reduce the risk but are **not a security boundary**; Python cannot be sandboxed
+  reliably in-process. Enable it only for sites you trust.
+- **Dry-run and approvals are heuristics.** They catch submit/pay/send-like labels and POST form submissions.
+  A page that changes something on a plain click or a GET request, or labels its button unusually, is not caught.
+- **There is no network allowlist.** The agent only navigates within the target site (plus sign-in hosts you
+  approve), but pages themselves can still load and call other domains as usual.
+- **What leaves your machine:** the page text, element labels, URLs and non-sensitive field values of every page the
+  agent visits are sent to the model provider's API. Password, card and one-time-code fields are never read or
+  filled, but other personal data shown on a page is included.
+- **Run logs (`runs/`) are sensitive.** They hold page text and screenshots of signed-in pages. Typed text, your
+  answers to the agent's questions and URL query strings are redacted, but the pages' own content is not.
+  `runs/` and `data/` are git-ignored; delete runs you no longer need.
+- **Attach mode (`--cdp-url`)** gives the agent the whole Chrome profile you launched. Use the dedicated profile
+  only, and close it when done.
 
 ## Troubleshooting
 
@@ -225,9 +250,9 @@ The terminal prints `Run folder: ...` at the start and `log: ...` at the end. Ex
 | Perception | Page distilled to numbered interactive elements + main text (`wayfinder/perception/snapshot.py`) |
 | Agent | Explicit graph: observe -> decide -> plan / act -> observe -> verify -> done. Tools: `plan, click, type, select, press, scroll, goto, back, wait, run_playwright, ask_human, done` |
 | Plan / Verify | First action must be `plan` (page controls -> goal mapping + checklist). After every action, code reports what changed (checked states, URL, result count) and warns if nothing changed. `done` is rejected until the checklist is complete |
-| Generated code | `run_playwright`: the agent writes short Playwright snippets; a guarded `page` blocks password fields, risky clicks (approval / dry-run), unseen `goto`, and context access |
+| Generated code (opt-in) | `--allow-code` enables `run_playwright`: the agent writes short Playwright snippets against a guarded `page` (no in-page JavaScript, no raw page/context, password fields refused, risky clicks and POST submits gated, `goto` only to seen links). Defence in depth, not a sandbox |
 | HILT | Login/password page detected -> pause until you press Enter; `ask_human`; approval before risky clicks |
-| Safety | Domain allowlist, sensitive fields never filled (and never sent to the LLM), page text treated as data, dry-run |
+| Safety | Domain allowlist, approval for off-site sign-in hosts, sensitive fields never filled, POST submissions and risky clicks gated, page text sanitised and treated as data, dry-run, redacted logs |
 | Reporting | JSONL step log, screenshots, result JSON |
 
 ## Layout
@@ -241,7 +266,9 @@ wayfinder/
   agent/loop.py             graph runner (observe -> decide -> plan/act/verify/done)
   agent/nodes.py            the graph nodes;  state.py = shared RunState
   agent/actions.py          act: executes one browser action with guards
-  agent/codeexec.py         guarded execution of model-written Playwright code
+  agent/codeexec.py         guarded execution of model-written Playwright code (--allow-code)
+  safety/sanitize.py        strip control chars / fake tags, redact logs
+  safety/pagechecks.py      in-page checks: sensitive fields, POST forms, submit controls
   agent/{tools,prompts,llm}.py
   perception/diff.py        verify: what changed between observations
   hilt/human.py             pause / ask / approve

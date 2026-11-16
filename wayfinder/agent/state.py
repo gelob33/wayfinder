@@ -61,6 +61,9 @@ class RunState:
     seen_urls: set[str] = field(default_factory=set)
     login_pauses: int = 0
     challenge_pauses: int = 0
+    # Off-site sign-in hosts (e.g. an identity provider) the person approved / declined this run.
+    approved_hosts: set[str] = field(default_factory=set)
+    declined_hosts: set[str] = field(default_factory=set)
     last_login_url: str | None = None
     # Set by `decide`, consumed by the next node:
     call: Any = None

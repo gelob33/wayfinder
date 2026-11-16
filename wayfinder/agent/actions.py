@@ -3,7 +3,14 @@
 from __future__ import annotations
 
 from ..hilt.human import AbortRun
-from ..safety.policy import domain_allowed, is_risky_click, normalize_url
+from ..safety.pagechecks import (
+    ACTIVATE_KEYS,
+    ACTIVE_BUTTON_LABEL_JS,
+    ACTIVE_IN_POST_FORM_JS,
+    ACTIVE_SENSITIVE_JS,
+    ENTER_KEYS,
+)
+from ..safety.policy import RISKY_LABEL, domain_allowed, is_risky_click, normalize_url
 from .codeexec import Policy, run_code
 from .state import Ctx, RunState
 
@@ -49,6 +56,17 @@ def _click(ctx: Ctx, el: dict) -> str:
     return msg
 
 
+def _gate(ctx: Ctx, state: RunState, what: str) -> str | None:
+    """Dry-run block / human approval for an action that may not be reversible. None = allowed."""
+    if ctx.settings.dry_run:
+        return f"BLOCKED (dry run): {what} would submit/pay/send. Not done; report what would happen."
+    if ctx.settings.require_approval and not ctx.human.approve(
+        f"{what} on {state.snap.url}\n  (task: {ctx.task.goal})"
+    ):
+        return f"DECLINED: the person did not approve: {what}."
+    return None
+
+
 def _do(ctx: Ctx, state: RunState, name: str, a: dict) -> str:
     page = ctx.session.page
     snap = state.snap
@@ -61,13 +79,11 @@ def _do(ctx: Ctx, state: RunState, name: str, a: dict) -> str:
             return f"ERROR: element [{el['id']}] is disabled."
 
     if name == "click":
-        if is_risky_click(el):
-            if ctx.settings.dry_run:
-                return f'BLOCKED (dry run): "{el["label"]}" would submit/pay/send. Not clicked; report what would happen.'
-            if ctx.settings.require_approval and not ctx.human.approve(
-                f'Click "{el["label"]}" on {snap.url}\n  (task: {ctx.task.goal})'
-            ):
-                return f'DECLINED: the person did not approve clicking "{el["label"]}".'
+        # Risky by label, or a submit control of a POST form (submitting can change something).
+        if is_risky_click(el) or (el.get("post") and el.get("submits")):
+            blocked = _gate(ctx, state, f'Click "{el["label"]}"')
+            if blocked:
+                return blocked
         return _click(ctx, el)
 
     if name == "type":
@@ -76,6 +92,10 @@ def _do(ctx: Ctx, state: RunState, name: str, a: dict) -> str:
         loc = _locator(ctx, el["id"])
         loc.fill(str(a.get("text", "")))
         if a.get("submit"):
+            if el.get("post"):  # Enter submits the form; GET forms (e.g. search) are not gated
+                blocked = _gate(ctx, state, f'Submit the form containing "{el["label"]}" (Enter)')
+                if blocked:
+                    return f'Typed into [{el["id"]}] but did not submit. ' + blocked
             loc.press("Enter")
             page.wait_for_timeout(400)
         return f'Typed into [{el["id"]}]' + (" and pressed Enter." if a.get("submit") else ".")
@@ -89,6 +109,18 @@ def _do(ctx: Ctx, state: RunState, name: str, a: dict) -> str:
         return f'Selected "{a["option"]}" in [{el["id"]}].'
 
     if name == "press":
+        key = str(a["key"])
+        if len(key) == 1 and page.evaluate(ACTIVE_SENSITIVE_JS):
+            return "REFUSED: focus is in a SENSITIVE field (password/card/code). The person must type there."
+        label = page.evaluate(ACTIVE_BUTTON_LABEL_JS) if key.lower() in ACTIVATE_KEYS else ""
+        if label and RISKY_LABEL.search(label):
+            blocked = _gate(ctx, state, f'Activate "{label}" ({key})')
+            if blocked:
+                return blocked
+        elif key.lower() in ENTER_KEYS and page.evaluate(ACTIVE_IN_POST_FORM_JS):
+            blocked = _gate(ctx, state, "Submit the focused form (Enter)")
+            if blocked:
+                return blocked
         page.keyboard.press(str(a["key"]))
         page.wait_for_timeout(300)
         return f'Pressed {a["key"]}.'
@@ -120,6 +152,8 @@ def _do(ctx: Ctx, state: RunState, name: str, a: dict) -> str:
         return "Waited."
 
     if name == "run_playwright":
+        if not ctx.settings.allow_code:
+            return "REJECTED: run_playwright is disabled for this run. Use the simple tools (click/type/select/press/scroll)."
         policy = Policy(
             allowed_domains=ctx.allowed,
             seen_urls=lambda: state.seen_urls,

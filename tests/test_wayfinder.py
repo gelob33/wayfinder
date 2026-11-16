@@ -14,6 +14,7 @@ PLAN = lambda m: ("plan", {"page_summary": "test page", "steps": ["do it"], "che
 
 def make_agent(tmp_path, session, task, steps, human=None, plan=True, **settings):
     """Build an Agent over scripted steps; a plan step is prepended unless plan=False."""
+    settings.setdefault("allow_code", True)  # most tests exercise run_playwright; the default (off) has its own test
     s = Settings(runs_dir=tmp_path / "runs", headless=True, **settings)
     human = human or FakeHuman()
     if plan:

@@ -36,3 +36,5 @@ class Settings:
     dry_run: bool = False
     # Ask the human before submit/pay/delete-like clicks.
     require_approval: bool = True
+    # Let the model write Playwright code (run_playwright). Off by default: it cannot be sandboxed safely.
+    allow_code: bool = False

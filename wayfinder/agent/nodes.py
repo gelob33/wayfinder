@@ -15,11 +15,11 @@ from playwright.sync_api import Error as PlaywrightError
 from ..hilt.human import AbortRun
 from ..perception.diff import describe_change
 from ..perception.snapshot import Snapshot, take_snapshot
-from ..safety.policy import domain_allowed, is_bot_challenge, is_sign_in_url, normalize_url
+from ..safety.policy import domain_allowed, host_of, is_bot_challenge, is_sign_in_url, normalize_url
 from . import actions
-from .prompts import SYSTEM
+from .prompts import system_prompt
 from .state import ChecklistItem, Ctx, RunResult, RunState
-from .tools import TOOLS
+from .tools import tools_for
 
 MAX_LOGIN_PAUSES = 5
 MAX_NUDGES = 3
@@ -81,9 +81,12 @@ def observe(ctx: Ctx, state: RunState) -> RunState:
     notes: list[str] = []
     page = ctx.session.page
     url = page.url
-    if url != "about:blank" and not domain_allowed(url, ctx.allowed) and not is_sign_in_url(url):
-        _leave_offsite(ctx, page)
-        notes.append(f"Navigation to {url} was blocked (outside the allowed site); returned to the previous page.")
+    if url != "about:blank" and not domain_allowed(url, ctx.allowed + sorted(state.approved_hosts)):
+        if _signin_host_approved(ctx, state, url):
+            notes.append(f"The person approved signing in at {host_of(url)}.")
+        else:
+            _leave_offsite(ctx, page)
+            notes.append(f"Navigation to {url} was blocked (outside the allowed site); returned to the previous page.")
     snap = _snap(ctx)
     if is_bot_challenge(snap.title, snap.text):
         # Never fight bot protection: hand off to the person once or twice, then stop cleanly.
@@ -122,9 +125,27 @@ def observe(ctx: Ctx, state: RunState) -> RunState:
     return state
 
 
+def _signin_host_approved(ctx: Ctx, state: RunState, url: str) -> bool:
+    """An off-site page that looks like a sign-in page is only trusted if the person approves its host."""
+    if not is_sign_in_url(url):
+        return False
+    host = host_of(url)
+    if host in state.declined_hosts:
+        return False
+    ctx.runlog.step(event="offsite_signin_prompt", host=host)
+    if ctx.human.approve_domain(host, url):
+        state.approved_hosts.add(host)
+        return True
+    state.declined_hosts.add(host)
+    return False
+
+
 def _leave_offsite(ctx: Ctx, page) -> None:
     try:
-        if len(ctx.session.context.pages) > 1:
+        others = [p for p in ctx.session.context.pages if p is not page and not p.is_closed()]
+        if ctx.session.cdp_url and others:
+            ctx.session.page = others[-1]  # attached to the person's browser: never close their tabs
+        elif len(ctx.session.context.pages) > 1:
             page.close()
             ctx.session.page = ctx.session.context.pages[-1]
         else:
@@ -143,7 +164,8 @@ def decide(ctx: Ctx, state: RunState) -> RunState:
     if state.tokens > ctx.settings.max_total_tokens:
         return finish(ctx, state, "budget_exceeded", "Token budget exceeded.")
     try:
-        response = ctx.llm.create(SYSTEM, TOOLS, state.messages)
+        allow = ctx.settings.allow_code
+        response = ctx.llm.create(system_prompt(allow), tools_for(allow), state.messages)
     except anthropic.APIError as e:
         return finish(ctx, state, "error", f"LLM API error: {e}")
     u = response.usage

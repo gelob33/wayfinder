@@ -34,6 +34,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="Attach to a Chrome you launched yourself with --remote-debugging-port (e.g. http://localhost:9222).")
     p.add_argument("--allow-domain", action="append", default=[], help="Extra allowed domain (repeatable).")
     p.add_argument("--dry-run", action="store_true", help="Never click submit/pay/send-like buttons.")
+    p.add_argument("--allow-code", action="store_true",
+                   help="Let the agent write and run Playwright code (run_playwright). Only for sites you trust.")
     p.add_argument("--no-approval", action="store_true", help="Do not ask before submit/pay/send-like clicks.")
     return p.parse_args(argv)
 
@@ -55,6 +57,7 @@ def build(args: argparse.Namespace) -> tuple[Task, Settings]:
         cdp_url=args.cdp_url,
         dry_run=args.dry_run,
         require_approval=not args.no_approval,
+        allow_code=args.allow_code,
     )
     if args.model:
         settings.model = args.model

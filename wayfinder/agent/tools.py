@@ -1,6 +1,6 @@
 """Tool schemas the model can call: one browser action per step."""
 
-TOOLS: list[dict] = [
+ALL_TOOLS: list[dict] = [
     {
         "name": "plan",
         "description": (
@@ -147,3 +147,11 @@ TOOLS: list[dict] = [
         },
     },
 ]
+
+
+def tools_for(allow_code: bool) -> list[dict]:
+    """Tool list for a run; `run_playwright` is only offered when the person opted in."""
+    return [t for t in ALL_TOOLS if allow_code or t["name"] != "run_playwright"]
+
+
+TOOLS = tools_for(False)

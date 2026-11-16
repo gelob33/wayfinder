@@ -17,6 +17,7 @@ from ..config import Settings, Task
 from ..hilt.human import AbortRun, Human
 from ..reporting.runlog import RunLog
 from ..safety.policy import default_allowed_domains, normalize_url
+from ..safety.sanitize import clean
 from . import nodes
 from .llm import LLM
 from .prompts import initial_message
@@ -41,7 +42,7 @@ class Agent:
             llm=llm,
             human=human,
             runlog=runlog,
-            out=out,
+            out=lambda text: out(clean(str(text))),  # model/page text may carry terminal escapes
             allowed=settings.allowed_domains or default_allowed_domains(task.url),
         )
 

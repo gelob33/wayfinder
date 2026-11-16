@@ -33,12 +33,14 @@ def session(tmp_path):
 
 
 class FakeHuman:
-    def __init__(self, approve=True, answer="ok"):
+    def __init__(self, approve=True, answer="ok", approve_domain=True):
         self.logins: list[str] = []
         self.challenges: list[str] = []
         self.asked: list[str] = []
         self.approvals: list[str] = []
         self._approve = approve
+        self._approve_domain = approve_domain
+        self.domain_prompts: list[str] = []
         self._answer = answer
 
     def wait_for_login(self, url):
@@ -46,6 +48,10 @@ class FakeHuman:
 
     def wait_for_challenge(self, url):
         self.challenges.append(url)
+
+    def approve_domain(self, host, url):
+        self.domain_prompts.append(host)
+        return self._approve_domain
 
     def ask(self, question):
         self.asked.append(question)

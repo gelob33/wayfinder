@@ -6,6 +6,8 @@ import json
 import time
 from pathlib import Path
 
+from ..safety.sanitize import redact_args, scrub_urls
+
 
 class RunLog:
     def __init__(self, runs_dir: Path):
@@ -19,9 +21,20 @@ class RunLog:
 
     def observation(self, step: int, text: str) -> None:
         """What the agent saw after this step (for auditing its claims)."""
-        (self.dir / f"step-{step:03d}.txt").write_text(text, encoding="utf-8")
+        (self.dir / f"step-{step:03d}.txt").write_text(scrub_urls(text), encoding="utf-8")
 
     def step(self, **entry) -> None:
+        # Keep secrets out of the log: typed text, the person's answers, URL query strings (tokens).
+        action = entry.get("action")
+        if isinstance(entry.get("args"), dict):
+            entry["args"] = redact_args(action, entry["args"])
+        if action == "ask_human" and "outcome" in entry:
+            entry["outcome"] = "The person answered: <redacted>"
+        for key in ("url", "outcome"):
+            if isinstance(entry.get(key), str):
+                entry[key] = scrub_urls(entry[key])
+        if isinstance(entry.get("changes"), list):
+            entry["changes"] = [scrub_urls(str(c)) for c in entry["changes"]]
         entry["t"] = round(time.time(), 2)
         with self._steps.open("a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")

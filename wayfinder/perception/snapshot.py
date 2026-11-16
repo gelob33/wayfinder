@@ -14,6 +14,7 @@ from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import Page
 
 from ..safety.policy import domain_allowed, is_sign_in_url, normalize_url
+from ..safety.sanitize import clean_page_text
 
 MAX_ELEMENTS = 300
 MAX_TEXT = 8000
@@ -88,6 +89,8 @@ _JS = r"""
     }
     if (e.disabled) item.disabled = true;
     if (sensitive) item.sensitive = true;
+    const form = e.form || e.closest('form');
+    if (form && (form.getAttribute('method') || 'get').toLowerCase() === 'post') item.post = true;
     out.push(item);
   }
   const body = document.body;
@@ -167,6 +170,8 @@ def _fmt(e: dict) -> str:
     for flag in ("required", "disabled", "submits"):
         if e.get(flag):
             parts.append(flag)
+    if e.get("post") and (e.get("submits") or e["tag"] in ("input", "textarea")):
+        parts.append("POST-form(submitting needs approval)")
     if e.get("sensitive"):
         parts.append("SENSITIVE(never fill)")
     if not e.get("inView"):
@@ -232,6 +237,14 @@ def take_snapshot(
     allowed: list[str] | None = None,
 ) -> Snapshot:
     data = _evaluate_with_retry(page, max_elements, max_text)
+    for e in data["elements"]:  # page-controlled strings: strip control chars / fake wrapper tags
+        e["label"] = clean_page_text(e.get("label", ""))
+        if "value" in e:
+            e["value"] = clean_page_text(e["value"])
+        if "options" in e:
+            e["options"] = [clean_page_text(o) for o in e["options"]]
+    data["title"] = clean_page_text(data["title"])
+    data["text"] = clean_page_text(data["text"])
     elements, urls = _clean_links(data["elements"], data["url"], allowed)
     return Snapshot(
         url=data["url"],
